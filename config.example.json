@@ -1,0 +1,48 @@
+{
+  "ws_url": "",
+  "access_token": "",
+  "allowed_groups": [],
+  "cooldown_seconds": null,
+  "at_sender": null,
+  "auto_reply": {
+    "enabled": null,
+    "probability": null,
+    "min_interval_seconds": null,
+    "max_replies_per_hour": null,
+    "context_messages": null,
+    "context_minutes": null,
+    "context_max_chars": null,
+    "context_max_images": null
+  },
+  "music": {
+    "enabled": null,
+    "search_url": "",
+    "timeout_seconds": null,
+    "max_query_chars": null
+  },
+  "web_search": {
+    "enabled": null
+  },
+  "novelai_image_generation": {
+    "enabled": null,
+    "allowed_groups": [],
+    "token": "",
+    "width": null,
+    "height": null,
+    "steps": null,
+    "guidance": null,
+    "sampler": "",
+    "timeout_seconds": null
+  },
+  "ai": {
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "system_prompt": "",
+    "timeout_seconds": null,
+    "max_tokens": null,
+    "max_input_chars": null,
+    "max_reply_chars": null,
+    "error_reply": ""
+  }
+}
