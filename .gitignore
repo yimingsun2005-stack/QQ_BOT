@@ -1,0 +1,17 @@
+config.json
+config.json.bak*
+config.json.tmp*
+*.lock
+*.pid
+*.log
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.zip
+*.tar.gz
