@@ -4,16 +4,6 @@
   "allowed_groups": [],
   "cooldown_seconds": null,
   "at_sender": null,
-  "auto_reply": {
-    "enabled": null,
-    "probability": null,
-    "min_interval_seconds": null,
-    "max_replies_per_hour": null,
-    "context_messages": null,
-    "context_minutes": null,
-    "context_max_chars": null,
-    "context_max_images": null
-  },
   "music": {
     "enabled": null,
     "search_url": "",
@@ -44,5 +34,15 @@
     "max_input_chars": null,
     "max_reply_chars": null,
     "error_reply": ""
+  },
+  "context": {
+    "context_messages": null,
+    "context_minutes": null,
+    "context_max_chars": null,
+    "context_max_images": null
+  },
+  "reply_limits": {
+    "min_interval_seconds": null,
+    "max_replies_per_hour": null
   }
 }

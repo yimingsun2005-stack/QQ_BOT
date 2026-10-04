@@ -1,24 +1,28 @@
-name: Linux tests
+name: CI
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python: ['3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
-      - name: Compile Python sources
-        run: python -m compileall -q bot.py runtime_config.py single_instance.py ai_client.py group_context.py message_utils.py music_service.py novelai_image_service.py web_search_service.py configure_chat_group.py tools tests
-      - run: python tools/build_release.py
+      - name: Compile runtime and release tools
+        run: python -m compileall -q -f *.py tools
+      - name: Check configuration, behavior, archives and Linux lifecycle
+        run: python tools/check_release.py
+      - name: Build clean release archives
+        run: python tools/build_release.py

@@ -164,38 +164,19 @@ class NovelAIImageService:
         config.validate()
         self.config = config
 
-    def build_payload(self, prompt: str) -> dict[str, Any]:
+    def build_payload(self, prompt: str, *, model: str='nai-diffusion-5-curated') -> dict[str, Any]:
+        if model not in ('nai-diffusion-5-full', 'nai-diffusion-5-curated'):
+            raise NovelAIServiceError('画图模型无效，请检查设置。')
         validate_prompt(prompt)
-        return {
-            "input": prompt, "model": MODEL, "action": "generate",
-            "parameters": {
-                "params_version": 4, "width": self.config.width, "height": self.config.height,
-                "steps": self.config.steps, "scale": self.config.guidance,
-                "sampler": self.config.sampler, "n_samples": 1,
-                "seed": secrets.randbelow(2**32), "negative_prompt": HEAVY_NEGATIVE_PROMPT,
-                "v4_prompt": {"caption": {"base_caption": prompt, "char_captions": []},
-                              "use_coords": False, "use_order": True},
-                "v4_negative_prompt": {
-                    "caption": {"base_caption": HEAVY_NEGATIVE_PROMPT, "char_captions": []},
-                    "legacy_uc": False,
-                },
-                "noise_schedule": "native", "cfg_rescale": 0,
-                "sm": False, "sm_dyn": False, "dynamic_thresholding": False,
-                "qualityToggle": False, "deliberate_euler_ancestral_bug": False,
-                "prefer_brownian": True,
-            },
-        }
+        return {'input': prompt, 'model': model, 'action': 'generate', 'parameters': {'params_version': 4, 'width': self.config.width, 'height': self.config.height, 'steps': self.config.steps, 'scale': self.config.guidance, 'sampler': self.config.sampler, 'n_samples': 1, 'seed': secrets.randbelow(2 ** 32), 'negative_prompt': HEAVY_NEGATIVE_PROMPT, 'v4_prompt': {'caption': {'base_caption': prompt, 'char_captions': []}, 'use_coords': False, 'use_order': True}, 'v4_negative_prompt': {'caption': {'base_caption': HEAVY_NEGATIVE_PROMPT, 'char_captions': []}, 'legacy_uc': False}, 'noise_schedule': 'native', 'cfg_rescale': 0, 'sm': False, 'sm_dyn': False, 'dynamic_thresholding': False, 'qualityToggle': False, 'deliberate_euler_ancestral_bug': False, 'prefer_brownian': True}}
 
-    async def generate(self, prompt: str) -> bytes:
-        payload = self.build_payload(prompt)
+    async def generate(self, prompt: str, *, model: str='nai-diffusion-5-curated') -> bytes:
+        payload = self.build_payload(prompt, model=model)
         if not self.config.token.strip():
-            raise NovelAIServiceError("请先在设置中填写 NovelAI Token。")
-        headers = {"Authorization": f"Bearer {self.config.token.strip()}", "Accept": "application/json"}
+            raise NovelAIServiceError('请先在配置中填写 NovelAI Token。')
+        headers = {'Authorization': f'Bearer {self.config.token.strip()}', 'Accept': 'application/json'}
         try:
-            async with aiohttp.ClientSession(
-                headers=headers, timeout=aiohttp.ClientTimeout(total=self.config.timeout_seconds),
-                trust_env=True,
-            ) as session:
+            async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=self.config.timeout_seconds), trust_env=True) as session:
                 async with session.post(API_URL, json=payload, allow_redirects=False) as response:
                     if not 200 <= response.status < 300:
                         raise NovelAIServiceError(self._status_error(response.status))
@@ -203,16 +184,16 @@ class NovelAIImageService:
                     async for chunk in response.content.iter_chunked(65536):
                         body.extend(chunk)
                         if len(body) > MAX_RESPONSE_BYTES:
-                            raise NovelAIServiceError("画图服务返回的数据过大，请稍后再试。")
+                            raise NovelAIServiceError('画图服务返回的数据过大，请稍后再试。')
             return await asyncio.to_thread(self.parse_response, bytes(body))
         except asyncio.TimeoutError:
-            raise NovelAIServiceError("画图超时，请稍后再试。") from None
+            raise NovelAIServiceError('画图超时，请稍后再试。') from None
         except aiohttp.ClientProxyConnectionError:
-            raise NovelAIServiceError("无法连接本机代理，请检查代理是否已启动。") from None
+            raise NovelAIServiceError('无法连接本机代理，请检查代理是否已启动。') from None
         except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientConnectorSSLError):
-            raise NovelAIServiceError("画图服务的安全连接校验失败，请检查系统时间和代理设置。") from None
+            raise NovelAIServiceError('画图服务的安全连接校验失败，请检查系统时间和代理设置。') from None
         except aiohttp.ClientError:
-            raise NovelAIServiceError("无法连接画图服务，请检查网络和系统代理后再试。") from None
+            raise NovelAIServiceError('无法连接画图服务，请检查网络和系统代理后再试。') from None
 
     @staticmethod
     def _status_error(status: int) -> str:

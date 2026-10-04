@@ -10,14 +10,13 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import secrets
 import signal
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -26,6 +25,7 @@ from urllib.request import url2pathname
 import aiohttp
 
 from ai_client import AIConfig, AIReplyService, AIServiceError, WebSearchConfig
+from chat_config import ContextConfig, ReplyLimitsConfig, read_chat_config
 from group_context import GroupContextStore
 from message_utils import (
     extract_mentioned_ids,
@@ -41,6 +41,7 @@ from music_service import (
     parse_music_command,
 )
 from single_instance import AlreadyRunningError, SingleInstance
+from runtime_config import ConfigurationError, normalize_config
 from novelai_image_service import (
     NovelAIImageConfig, NovelAIImageService, NovelAIServiceError,
     parse_image_command, validate_prompt,
@@ -59,44 +60,61 @@ class BotConfig:
     ai: AIConfig = field(default_factory=AIConfig)
     web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
     music: MusicConfig = field(default_factory=MusicConfig)
-    auto_reply: AutoReplyConfig = field(default_factory=lambda: AutoReplyConfig())
+    context: ContextConfig = field(default_factory=ContextConfig)
+    reply_limits: ReplyLimitsConfig = field(default_factory=ReplyLimitsConfig)
     novelai_image_generation: NovelAIImageConfig = field(default_factory=NovelAIImageConfig)
 
     @classmethod
     def load(cls, path: Path) -> "BotConfig":
-        from runtime_config import load_bot_config
-        return load_bot_config(path)
-
-
-@dataclass(frozen=True)
-class AutoReplyConfig:
-    probability: float = 0.1
-    min_interval_seconds: float = 30.0
-    max_replies_per_hour: int = 100
-    context_messages: int = 20
-    context_minutes: float = 15.0
-    context_max_chars: int = 4000
-    context_max_images: int = 3
-    enabled: bool = True
-
-    def validate(self) -> None:
-        if not isinstance(self.enabled, bool):
-            raise ValueError("auto_reply.enabled 必须是布尔值")
-        if not 0 <= self.probability <= 0.5:
-            raise ValueError("auto_reply.probability 必须在 0 到 0.5 之间")
-        if not 0 <= self.min_interval_seconds <= 3600:
-            raise ValueError("auto_reply.min_interval_seconds 必须在 0 到 3600 之间")
-        if not 1 <= self.max_replies_per_hour <= 1000:
-            raise ValueError("auto_reply.max_replies_per_hour 必须在 1 到 1000 之间")
-        if not 1 <= self.context_messages <= 100:
-            raise ValueError("auto_reply.context_messages 必须在 1 到 100 之间")
-        if not 1 <= self.context_minutes <= 1440:
-            raise ValueError("auto_reply.context_minutes 必须在 1 到 1440 分钟之间")
-        if not 100 <= self.context_max_chars <= 20000:
-            raise ValueError("auto_reply.context_max_chars 必须在 100 到 20000 之间")
-        if not 0 <= self.context_max_images <= 10:
-            raise ValueError("auto_reply.context_max_images 必须在 0 到 10 之间")
-
+        with path.open("r", encoding="utf-8") as file:
+            raw = json.load(file)
+        ai_defaults = asdict(AIConfig())
+        ai_defaults.update(base_url="", api_key="", model="")
+        defaults = {
+            "ws_url": "", "access_token": "", "allowed_groups": [],
+            "cooldown_seconds": 5.0, "at_sender": True,
+            "ai": ai_defaults,
+            "music": {**asdict(MusicConfig()), "enabled": False},
+            "web_search": {"enabled": False},
+            "context": asdict(ContextConfig()),
+            "reply_limits": asdict(ReplyLimitsConfig()),
+            "novelai_image_generation": asdict(NovelAIImageConfig()),
+        }
+        # Migrate old context names in memory; never rewrite the source file.
+        from chat_config import migrate_chat_config
+        if not isinstance(raw, dict):
+            raise ConfigurationError("config")
+        data = normalize_config(migrate_chat_config(raw), defaults)
+        ws_url = os.getenv("ONEBOT_WS_URL", data["ws_url"]).strip()
+        token = os.getenv("ONEBOT_ACCESS_TOKEN", data["access_token"]).strip()
+        if not ws_url.startswith(("ws://", "wss://")) or not urlsplit(ws_url).hostname:
+            raise ConfigurationError("ws_url")
+        groups = frozenset(data["allowed_groups"])
+        if not groups:
+            raise ConfigurationError("allowed_groups")
+        cooldown = data["cooldown_seconds"]
+        if not 0 <= cooldown <= 3600:
+            raise ConfigurationError("cooldown_seconds")
+        ai_data = data["ai"]
+        ai_data["api_key"] = (ai_data["api_key"] or os.getenv("AI_API_KEY")
+                               or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        for key in ("base_url", "api_key", "model"):
+            if not ai_data[key]:
+                raise ConfigurationError("ai." + key)
+        ai = AIConfig(**ai_data)
+        ai.validate()
+        music = MusicConfig(**data["music"])
+        music.validate()
+        context, reply_limits = read_chat_config(data)
+        novelai = NovelAIImageConfig.from_mapping(data["novelai_image_generation"])
+        if novelai.enabled and not novelai.token.strip():
+            raise ConfigurationError("novelai_image_generation.token")
+        return cls(
+            ws_url=ws_url, access_token=token, allowed_groups=groups,
+            cooldown_seconds=cooldown, at_sender=data["at_sender"], ai=ai,
+            web_search=WebSearchConfig(**data["web_search"]), music=music,
+            context=context, reply_limits=reply_limits, novelai_image_generation=novelai,
+        )
 
 
 class AIBot:
@@ -117,10 +135,10 @@ class AIBot:
         self._image_busy = False
         self._image_task: asyncio.Task[None] | None = None
         self.context = GroupContextStore(
-            max_messages=self.config.auto_reply.context_messages,
-            max_age_seconds=self.config.auto_reply.context_minutes * 60,
-            max_text_chars=self.config.auto_reply.context_max_chars,
-            max_images=self.config.auto_reply.context_max_images,
+            max_messages=self.config.context.context_messages,
+            max_age_seconds=self.config.context.context_minutes * 60,
+            max_text_chars=self.config.context.context_max_chars,
+            max_images=self.config.context.context_max_images,
         )
         self._stopping = asyncio.Event()
         self._last_reply_at: dict[tuple[str, str], float] = {}
@@ -185,7 +203,7 @@ class AIBot:
                     if self._stopping.is_set():
                         break
                     LOGGER.warning(
-                        "连接中断（%s）；%.0f 秒后重试", type(exc).__name__, reconnect_delay
+                        "连接中断：%s；%.0f 秒后重试", type(exc).__name__, reconnect_delay
                     )
                     try:
                         await asyncio.wait_for(
@@ -271,8 +289,7 @@ class AIBot:
         if not group_id or not user_id or user_id == self_id:
             return
         chat_allowed = group_id in self.config.allowed_groups
-        image_allowed = group_id in self.config.novelai_image_generation.allowed_groups
-        if not chat_allowed and not image_allowed:
+        if not chat_allowed:
             return
 
         now = time.monotonic()
@@ -315,8 +332,8 @@ class AIBot:
         if not self.config.novelai_image_generation.enabled:
             await self._send_text_reply(websocket, group_id, user_id, "画图功能未开启")
             return True
-        if group_id not in self.config.novelai_image_generation.allowed_groups:
-            await self._send_text_reply(websocket, group_id, user_id, "本群未开启画图，请在设置中填写允许画图的群号。")
+        if group_id not in self.config.allowed_groups:
+            await self._send_text_reply(websocket, group_id, user_id, '本群未加入常规功能白名单，无法画图。')
             return True
         cooldown_key = (group_id, user_id)
         now = time.monotonic()
@@ -421,7 +438,7 @@ class AIBot:
             self._last_reply_at[cooldown_key] = now
             return
 
-        if not self._should_reply(group_id, mentioned, now, event):
+        if not self._should_reply(group_id, mentioned, now):
             return
 
         self._reserve_group_reply(group_id, now)
@@ -430,15 +447,10 @@ class AIBot:
         try:
             reply = await self.ai_service.generate_reply(group_id, prompt, context)
         except AIServiceError as exc:
-            LOGGER.warning("AI 回复失败（当前消息图片：%s）：%s", bool(image_data_url), type(exc).__name__)
-            if not mentioned:
-                recent = self._group_reply_times.get(group_id)
-                if recent and recent[-1] == now:
-                    recent.pop()
-                return
+            LOGGER.warning("AI 回复失败：%s", type(exc).__name__)
             reply = self.config.ai.error_reply
         message: list[dict[str, Any]] = []
-        if mentioned and self.config.at_sender:
+        if self.config.at_sender:
             message.extend(
                 [
                     {"type": "at", "data": {"qq": user_id}},
@@ -469,11 +481,10 @@ class AIBot:
         group_id: str,
         mentioned: bool,
         now: float,
-        event: dict[str, Any] | None = None,
     ) -> bool:
-        config = self.config.auto_reply
-        if not mentioned and not config.enabled:
+        if not mentioned:
             return False
+        config = self.config.reply_limits
         recent = self._group_reply_times.setdefault(group_id, deque())
         while recent and recent[0] <= now - 3600:
             recent.popleft()
@@ -482,12 +493,7 @@ class AIBot:
         last_reply = self._last_group_reply_at.get(group_id)
         if last_reply is not None and now - last_reply < config.min_interval_seconds:
             return False
-        if mentioned:
-            return True
-        probability = config.probability
-        if event and self._is_reply_to_bot(group_id, event):
-            probability = 0.5
-        return random.random() < probability
+        return True
 
     def _is_reply_to_bot(self, group_id: str, event: dict[str, Any]) -> bool:
         message = event.get("message")
@@ -510,7 +516,7 @@ class AIBot:
         websocket: aiohttp.ClientWebSocketResponse,
         event: dict[str, Any],
     ) -> str | None:
-        if self.config.auto_reply.context_max_images <= 0:
+        if self.config.context.context_max_images <= 0:
             return None
         for data in self._image_segments(event):
             for key in ("url", "file"):
@@ -589,6 +595,9 @@ class AIBot:
         websocket: aiohttp.ClientWebSocketResponse,
         action: str,
         params: dict[str, Any],
+	*,
+        timeout_seconds: float = 10,
+        allow_async: bool = False,
     ) -> dict[str, Any]:
         echo = str(uuid.uuid4())
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -597,11 +606,13 @@ class AIBot:
             await websocket.send_json(
                 {"action": action, "params": params, "echo": echo}
             )
-            response = await asyncio.wait_for(future, timeout=10)
+            response = await asyncio.wait_for(future, timeout=timeout_seconds)
         finally:
             self._pending_actions.pop(echo, None)
+        if allow_async and response.get("status") == "async" and response.get("retcode") == 1:
+            return response
         if response.get("status") != "ok" or response.get("retcode", 0) != 0:
-            raise ValueError("OneBot 接口调用失败")
+            raise ValueError("OneBot 图片接口失败")
         return response
 
     async def _download_image(self, url: str) -> str | None:
@@ -683,7 +694,7 @@ class AIBot:
         try:
             validate_prompt(prompt)
             if not self.config.novelai_image_generation.token.strip():
-                raise NovelAIServiceError("请先在设置中填写 NovelAI Token。")
+                raise NovelAIServiceError("请先在配置中填写 NovelAI Token。")
         except NovelAIServiceError as exc:
             await self._send_text_reply(websocket, group_id, user_id, str(exc))
             return
@@ -713,7 +724,7 @@ class AIBot:
     ) -> None:
         try:
             try:
-                image = await self.image_service.generate(prompt)
+                image = await self.image_service.generate(prompt, model='nai-diffusion-5-full' if group_id in self.config.novelai_image_generation.allowed_groups else 'nai-diffusion-5-curated')
             except NovelAIServiceError as exc:
                 await self._send_text_reply(websocket, group_id, user_id, str(exc))
                 return
@@ -730,16 +741,72 @@ class AIBot:
             try:
                 response = await self._call_onebot_action(
                     websocket, "send_group_msg", {"group_id": group_id, "message": message},
+                    timeout_seconds=120, allow_async=True,
                 )
-                if response.get("retcode", 0) != 0:
-                    raise ValueError("图片发送失败")
                 data = response.get("data")
                 if isinstance(data, dict) and data.get("message_id") is not None:
                     self._bot_message_ids.setdefault(group_id, deque(maxlen=128)).append(str(data["message_id"]))
-            except (ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError, RuntimeError):
-                await self._send_text_reply(websocket, group_id, user_id, "图片发送失败或未收到确认，请稍后再试。")
+            except asyncio.TimeoutError:
+                LOGGER.warning("图片发送确认等待超时；不重复发送或重新生成")
+            except (ValueError, aiohttp.ClientError, ConnectionError, RuntimeError):
+                await self._send_text_reply(websocket, group_id, user_id, "图片发送失败，请稍后再试。")
         finally:
             self._image_busy = False
+    async def _build_signed_music_segment(self, track: Any) -> dict[str, Any]:
+        sign_url = os.getenv("MUSIC_SIGN_URL", "").strip()
+        if not sign_url:
+            return build_netease_music_segment(track)
+        if not sign_url.startswith(("https://", "http://")) or not urlsplit(sign_url).hostname:
+            raise MusicServiceError("MUSIC_SIGN_URL 格式无效")
+        song_id = str(track.song_id)
+        if not song_id.isascii() or not song_id.isdigit():
+            raise MusicServiceError("网易云音乐歌曲 ID 无效")
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://music.163.com/api/song/detail/",
+                params={"id": song_id, "ids": f"[{song_id}]"},
+            ) as response:
+                if response.status != 200:
+                    raise MusicServiceError("无法获取网易云音乐详情")
+                info = await response.json(content_type=None)
+            songs = info.get("songs") if isinstance(info, dict) else None
+            song = songs[0] if isinstance(songs, list) and songs else None
+            if not isinstance(song, dict) or str(song.get("id")) != song_id:
+                raise MusicServiceError("网易云音乐详情与歌曲 ID 不匹配")
+            title = song.get("name")
+            album = song.get("album") or song.get("al") or {}
+            image = album.get("picUrl") if isinstance(album, dict) else None
+            if not isinstance(title, str) or not title.strip():
+                raise MusicServiceError("网易云音乐详情缺少标题")
+            if not isinstance(image, str) or not image.startswith(("https://", "http://")):
+                raise MusicServiceError("网易云音乐详情缺少封面")
+            artists = song.get("artists") or song.get("ar") or []
+            singer = "/".join(
+                artist["name"] for artist in artists
+                if isinstance(artist, dict) and isinstance(artist.get("name"), str)
+            ) if isinstance(artists, list) else ""
+            payload = {
+                "type": "163", "id": song_id, "title": title,
+                "singer": singer or track.artists,
+                "url": "https://music.163.com/song?id=" + song_id,
+                "audio": "https://music.163.com/song/media/outer/url?id=" + song_id + ".mp3",
+                "image": image,
+            }
+            async with session.post(sign_url, json=payload) as response:
+                if response.status != 200:
+                    raise MusicServiceError("音乐卡片签名服务未正常返回")
+                card = await response.json(content_type=None)
+        if isinstance(card, str):
+            card = json.loads(card)
+        if (
+            not isinstance(card, dict)
+            or not isinstance(card.get("app"), str) or not card["app"]
+            or card.get("view") != "music"
+            or not isinstance(card.get("meta"), dict) or not card["meta"]
+        ):
+            raise MusicServiceError("音乐卡片签名服务未返回有效卡片")
+        return {"type": "json", "data": {"data": json.dumps(card, ensure_ascii=False)}}
 
     async def _handle_music_request(
         self,
@@ -779,17 +846,21 @@ class AIBot:
             return
 
         try:
+            segment = await self._build_signed_music_segment(track)
             response = await self._call_onebot_action(
                 websocket,
                 "send_group_msg",
-                {"group_id": group_id, "message": [build_netease_music_segment(track)]},
+                {"group_id": group_id, "message": [segment]},
+                timeout_seconds=30,
             )
             data = response.get("data")
             message_id = data.get("message_id") if isinstance(data, dict) else None
             if message_id is None:
                 raise ValueError("音乐卡片未返回发送确认")
-        except (ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError, RuntimeError) as exc:
-            LOGGER.warning("音乐卡片发送未确认：%s", type(exc).__name__)
+        except (
+            ValueError, asyncio.TimeoutError, aiohttp.ClientError,
+            ConnectionError, RuntimeError,
+        ):
             await self._send_text_reply(
                 websocket,
                 group_id,
@@ -797,7 +868,9 @@ class AIBot:
                 "音乐卡片发送失败或未收到确认，请稍后再试。",
             )
             return
-        self._bot_message_ids.setdefault(group_id, deque(maxlen=128)).append(str(message_id))
+        self._bot_message_ids.setdefault(
+            group_id, deque(maxlen=128)
+        ).append(str(message_id))
         LOGGER.info("网易云音乐卡片发送已确认")
 
     async def _send_text_reply(
@@ -837,12 +910,8 @@ class AIBot:
         )
 
 
-def resolve_config_path() -> Path:
-    return Path(os.getenv("BOT_CONFIG") or Path(__file__).with_name("config.json")).resolve()
-
-
-async def async_main() -> None:
-    config_path = resolve_config_path()
+async def async_main(config_path: Path | None = None) -> None:
+    config_path = config_path or Path(os.getenv("BOT_CONFIG", "config.json")).resolve()
     config = BotConfig.load(config_path)
     bot = AIBot(config)
     loop = asyncio.get_running_loop()
@@ -856,25 +925,23 @@ async def async_main() -> None:
 
 def main() -> None:
     logging.basicConfig(
-        level={"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
-               "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}.get(
-                   os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(lambda record: record.name == LOGGER.name)
     try:
-        with SingleInstance(resolve_config_path()):
-            asyncio.run(async_main())
+        config_path = Path(os.getenv("BOT_CONFIG", "config.json")).resolve()
+        with SingleInstance(config_path):
+            asyncio.run(async_main(config_path))
     except KeyboardInterrupt:
         LOGGER.info("机器人已停止")
     except AlreadyRunningError as exc:
         LOGGER.error("%s", exc)
         raise SystemExit(2) from exc
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        LOGGER.error("启动失败（%s）：请检查配置文件及字段要求", type(exc).__name__)
+        LOGGER.error("启动失败：%s", str(exc) if isinstance(exc, ConfigurationError) else type(exc).__name__)
         raise SystemExit(1) from exc
-    except Exception as exc:
-        LOGGER.error("运行失败（%s）", type(exc).__name__)
-        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

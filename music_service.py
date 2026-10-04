@@ -15,7 +15,7 @@ class MusicServiceError(RuntimeError):
 @dataclass(frozen=True)
 class MusicConfig:
     enabled: bool = True
-    search_url: str = "https://music.163.com/api/search/get"
+    search_url: str = "https://music.163.com/api/search/get/web"
     timeout_seconds: float = 10.0
     max_query_chars: int = 100
 
@@ -118,17 +118,11 @@ class NeteaseMusicService:
 
     @staticmethod
     def _parse_first_track(data: dict[str, Any]) -> MusicTrack | None:
-        if data.get("code", 200) not in (200, "200"):
-            raise MusicServiceError("网易云音乐搜索接口未正常返回结果")
         result = data.get("result")
         if not isinstance(result, dict):
-            raise MusicServiceError("网易云音乐搜索接口缺少结果数据")
-        songs = result.get("songs")
-        if songs is None and result.get("songCount") == 0:
             return None
-        if not isinstance(songs, list):
-            raise MusicServiceError("网易云音乐搜索接口歌曲列表格式无效")
-        if not songs:
+        songs = result.get("songs")
+        if not isinstance(songs, list) or not songs:
             return None
 
         song = songs[0]

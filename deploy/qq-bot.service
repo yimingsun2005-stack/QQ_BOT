@@ -1,21 +1,21 @@
 [Unit]
-Description=QQ_BOT headless OneBot service
-Wants=network-online.target
+Description=QQ_BOT server
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=qqbot
 Group=qqbot
 WorkingDirectory=/opt/QQ_BOT
-Environment=PYTHONUNBUFFERED=1
 Environment=BOT_CONFIG=/etc/qq-bot/config.json
-EnvironmentFile=-/etc/qq-bot/environment
+Environment=LOG_LEVEL=INFO
 ExecStart=/opt/QQ_BOT/.venv/bin/python /opt/QQ_BOT/bot.py
 Restart=on-failure
 RestartPreventExitStatus=1 2
 RestartSec=5
 TimeoutStopSec=30
+KillSignal=SIGTERM
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
