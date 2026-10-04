@@ -135,7 +135,7 @@ class ConfigurationChecks(unittest.TestCase):
         service = AIReplyService(config.ai, replace(config.web_search, enabled=True))
         self.assertEqual(service._build_message_payload([])["tools"][0]["name"], "web_search")
         with self.assertRaises(AIServiceError):
-            service._extract_message_text({"stop_reason": "max_tokens", "content": []})
+            service._extract_message_text({"type": "message", "stop_reason": "max_tokens", "content": []})
 
     def test_context_isolated_and_bounded(self):
         context = GroupContextStore(max_messages=2, max_age_seconds=30)
@@ -211,7 +211,7 @@ class BehaviorChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["model"], "synthetic-model")
             if ai_calls > 1:
                 ai_started.set(); await release_ai.wait()
-            return web.json_response({"stop_reason": "end_turn", "content": [{"type": "text", "text": "mock-answer"}]})
+            return web.json_response({"type": "message", "stop_reason": "end_turn", "content": [{"type": "text", "text": "mock-answer"}]})
         async def websocket(request):
             nonlocal connections
             ws = web.WebSocketResponse(); await ws.prepare(request); connections += 1
